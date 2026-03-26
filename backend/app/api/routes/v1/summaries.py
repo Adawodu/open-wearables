@@ -1,8 +1,7 @@
 """Summary endpoints that aggregate event_record data into daily summaries.
 
-Returns flattened response format compatible with the Amina client:
-- ActivitySummary: date, steps, active_calories, resting_heart_rate, distance_meters, etc.
-- SleepSummary: date, total_duration_seconds, deep_sleep_seconds, sleep_score, etc.
+Uses raw SQL to query production DB schema (data_source FK, not external_device_mapping).
+Returns flat response format compatible with the Amina client.
 """
 
 from datetime import datetime
@@ -11,20 +10,19 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Query
-from sqlalchemy import and_, func, text
+from sqlalchemy import text
 
 from app.database import DbSession
 from app.schemas.common_types import Pagination, TimeseriesMetadata
 from app.services import ApiKeyDep
 from pydantic import BaseModel
 
-logger = getLogger(__name__)
-
 router = APIRouter()
+logger = getLogger(__name__)
 
 
 class FlatPaginatedResponse(BaseModel):
-    """Paginated response with flat data items (no nested source)."""
+    """Paginated response with flat data items."""
     data: list[dict[str, Any]]
     pagination: Pagination
     metadata: TimeseriesMetadata
@@ -46,69 +44,56 @@ async def get_activity_summary(
 
     summaries: list[dict[str, Any]] = []
 
-    # Try to query event_record tables — may not exist in DB yet
     try:
-        if not _table_exists(db, "event_record"):
-            raise Exception("Table not found")
-
-        from app.models import EventRecord, ExternalDeviceMapping
-        from app.models.workout_details import WorkoutDetails
-
-        rows = (
-            db.query(
-                func.date(EventRecord.start_datetime).label("day"),
-                ExternalDeviceMapping.provider_name,
-                func.sum(WorkoutDetails.steps_count).label("steps"),
-                func.sum(WorkoutDetails.energy_burned).label("calories"),
-                func.sum(WorkoutDetails.distance).label("distance"),
-                func.sum(EventRecord.duration_seconds).label("duration"),
-                func.min(WorkoutDetails.heart_rate_avg).label("resting_hr"),
-                func.max(WorkoutDetails.heart_rate_max).label("max_hr"),
-                func.avg(WorkoutDetails.heart_rate_avg).label("avg_hr"),
-                func.sum(WorkoutDetails.moving_time_seconds).label("active_time"),
-            )
-            .join(ExternalDeviceMapping, EventRecord.external_device_mapping_id == ExternalDeviceMapping.id)
-            .outerjoin(WorkoutDetails, WorkoutDetails.record_id == EventRecord.id)
-            .filter(
-                and_(
-                    ExternalDeviceMapping.user_id == user_id,
-                    EventRecord.category.in_(["daily", "workout"]),
-                    EventRecord.start_datetime >= start_dt,
-                    EventRecord.start_datetime <= end_dt,
-                ),
-            )
-            .group_by(func.date(EventRecord.start_datetime), ExternalDeviceMapping.provider_name)
-            .order_by(func.date(EventRecord.start_datetime).desc())
-            .limit(limit)
-            .all()
-        )
+        rows = db.execute(
+            text("""
+                SELECT
+                    DATE(er.start_datetime) as day,
+                    ds.provider,
+                    SUM(wd.steps_count) as steps,
+                    SUM(wd.energy_burned) as calories,
+                    SUM(wd.distance) as distance,
+                    SUM(er.duration_seconds) as duration,
+                    MIN(wd.heart_rate_avg) as resting_hr,
+                    MAX(wd.heart_rate_max) as max_hr,
+                    AVG(wd.heart_rate_avg) as avg_hr,
+                    SUM(wd.moving_time_seconds) as active_time
+                FROM event_record er
+                JOIN data_source ds ON er.data_source_id = ds.id
+                LEFT JOIN workout_details wd ON wd.record_id = er.id
+                WHERE ds.user_id = :uid
+                  AND er.category IN ('daily', 'workout')
+                  AND er.start_datetime >= :start
+                  AND er.start_datetime <= :end
+                GROUP BY DATE(er.start_datetime), ds.provider
+                ORDER BY DATE(er.start_datetime) DESC
+                LIMIT :lim
+            """),
+            {"uid": str(user_id), "start": start_dt, "end": end_dt, "lim": limit},
+        ).fetchall()
 
         for row in rows:
             summaries.append({
-                "date": str(row.day),
-                "steps": int(row.steps) if row.steps else None,
-                "active_calories": float(row.calories) if row.calories else None,
+                "date": str(row[0]),
+                "steps": int(row[2]) if row[2] else None,
+                "active_calories": float(row[3]) if row[3] else None,
                 "total_calories": None,
-                "active_duration_seconds": int(row.active_time or row.duration or 0) or None,
-                "distance_meters": float(row.distance) if row.distance else None,
+                "active_duration_seconds": int(row[9] or row[5] or 0) or None,
+                "distance_meters": float(row[4]) if row[4] else None,
                 "floors_climbed": None,
-                "avg_heart_rate": int(float(row.avg_hr)) if row.avg_hr else None,
-                "max_heart_rate": int(row.max_hr) if row.max_hr else None,
-                "resting_heart_rate": int(float(row.resting_hr)) if row.resting_hr else None,
-                "provider": row.provider_name or "unknown",
+                "avg_heart_rate": int(float(row[8])) if row[8] else None,
+                "max_heart_rate": int(row[7]) if row[7] else None,
+                "resting_heart_rate": int(float(row[6])) if row[6] else None,
+                "provider": row[1] or "unknown",
             })
     except Exception as e:
-        logger.warning(f"Activity summary query failed (tables may not exist): {e}")
+        logger.warning(f"Activity summary query failed: {e}")
         db.rollback()
 
     return FlatPaginatedResponse(
         data=summaries,
         pagination=Pagination(next_cursor=None, has_more=False),
-        metadata=TimeseriesMetadata(
-            sample_count=len(summaries),
-            start_time=start_dt,
-            end_time=end_dt,
-        ),
+        metadata=TimeseriesMetadata(sample_count=len(summaries), start_time=start_dt, end_time=end_dt),
     )
 
 
@@ -129,127 +114,79 @@ async def get_sleep_summary(
     summaries: list[dict[str, Any]] = []
 
     try:
-        if not _table_exists(db, "event_record"):
-            raise Exception("Table not found")
+        rows = db.execute(
+            text("""
+                SELECT
+                    DATE(er.start_datetime) as day,
+                    ds.provider,
+                    sd.sleep_total_duration_minutes,
+                    sd.sleep_deep_minutes,
+                    sd.sleep_light_minutes,
+                    sd.sleep_rem_minutes,
+                    sd.sleep_awake_minutes,
+                    sd.sleep_efficiency_score,
+                    er.duration_seconds
+                FROM event_record er
+                JOIN data_source ds ON er.data_source_id = ds.id
+                LEFT JOIN sleep_details sd ON sd.record_id = er.id
+                WHERE ds.user_id = :uid
+                  AND er.category = 'sleep'
+                  AND er.start_datetime >= :start
+                  AND er.start_datetime <= :end
+                ORDER BY er.start_datetime DESC
+                LIMIT :lim
+            """),
+            {"uid": str(user_id), "start": start_dt, "end": end_dt, "lim": limit},
+        ).fetchall()
 
-        from app.models import EventRecord, ExternalDeviceMapping
-        from app.models.sleep_details import SleepDetails
-
-        rows = (
-            db.query(
-                EventRecord,
-                SleepDetails,
-                ExternalDeviceMapping.provider_name,
-            )
-            .join(ExternalDeviceMapping, EventRecord.external_device_mapping_id == ExternalDeviceMapping.id)
-            .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
-            .filter(
-                and_(
-                    ExternalDeviceMapping.user_id == user_id,
-                    EventRecord.category == "sleep",
-                    EventRecord.start_datetime >= start_dt,
-                    EventRecord.start_datetime <= end_dt,
-                ),
-            )
-            .order_by(EventRecord.start_datetime.desc())
-            .limit(limit)
-            .all()
-        )
-
-        for record, sleep_detail, provider_name in rows:
-            duration_seconds = None
-            deep = light = rem = awake = score = None
-
-            if sleep_detail:
-                duration_seconds = (sleep_detail.sleep_total_duration_minutes or 0) * 60
-                deep = (sleep_detail.sleep_deep_minutes or 0) * 60 if sleep_detail.sleep_deep_minutes else None
-                light = (sleep_detail.sleep_light_minutes or 0) * 60 if sleep_detail.sleep_light_minutes else None
-                rem = (sleep_detail.sleep_rem_minutes or 0) * 60 if sleep_detail.sleep_rem_minutes else None
-                awake = (sleep_detail.sleep_awake_minutes or 0) * 60 if sleep_detail.sleep_awake_minutes else None
-                score = float(sleep_detail.sleep_efficiency_score) if sleep_detail.sleep_efficiency_score else None
-            elif record.duration_seconds:
-                duration_seconds = record.duration_seconds
-
+        for row in rows:
+            duration_s = (row[2] or 0) * 60 if row[2] else (row[8] or None)
             summaries.append({
-                "date": str(record.start_datetime.date()),
-                "total_duration_seconds": duration_seconds,
-                "deep_sleep_seconds": deep,
-                "light_sleep_seconds": light,
-                "rem_sleep_seconds": rem,
-                "awake_seconds": awake,
-                "sleep_score": score,
-                "provider": provider_name or "unknown",
+                "date": str(row[0]),
+                "total_duration_seconds": duration_s,
+                "deep_sleep_seconds": row[3] * 60 if row[3] else None,
+                "light_sleep_seconds": row[4] * 60 if row[4] else None,
+                "rem_sleep_seconds": row[5] * 60 if row[5] else None,
+                "awake_seconds": row[6] * 60 if row[6] else None,
+                "sleep_score": float(row[7]) if row[7] else None,
+                "provider": row[1] or "unknown",
             })
     except Exception as e:
-        logger.warning(f"Sleep summary query failed (tables may not exist): {e}")
+        logger.warning(f"Sleep summary query failed: {e}")
         db.rollback()
 
     return FlatPaginatedResponse(
         data=summaries,
         pagination=Pagination(next_cursor=None, has_more=False),
-        metadata=TimeseriesMetadata(
-            sample_count=len(summaries),
-            start_time=start_dt,
-            end_time=end_dt,
-        ),
+        metadata=TimeseriesMetadata(sample_count=len(summaries), start_time=start_dt, end_time=end_dt),
     )
 
 
 @router.get("/users/{user_id}/summaries/recovery")
 async def get_recovery_summary(
-    user_id: UUID,
-    start_date: str,
-    end_date: str,
-    db: DbSession,
-    _api_key: ApiKeyDep,
-    cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    user_id: UUID, start_date: str, end_date: str, db: DbSession, _api_key: ApiKeyDep,
+    cursor: str | None = None, limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> FlatPaginatedResponse:
-    """Returns daily recovery metrics."""
-    return FlatPaginatedResponse(
-        data=[],
-        pagination=Pagination(next_cursor=None, has_more=False),
-        metadata=TimeseriesMetadata(
-            sample_count=0,
-            start_time=_parse_date(start_date),
-            end_time=_parse_date(end_date),
-        ),
-    )
+    return _empty_response(start_date, end_date)
 
 
 @router.get("/users/{user_id}/summaries/body")
 async def get_body_summary(
-    user_id: UUID,
-    start_date: str,
-    end_date: str,
-    db: DbSession,
-    _api_key: ApiKeyDep,
-    cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    user_id: UUID, start_date: str, end_date: str, db: DbSession, _api_key: ApiKeyDep,
+    cursor: str | None = None, limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> FlatPaginatedResponse:
-    """Returns daily body metrics."""
+    return _empty_response(start_date, end_date)
+
+
+def _empty_response(start_date: str, end_date: str) -> FlatPaginatedResponse:
     return FlatPaginatedResponse(
         data=[],
         pagination=Pagination(next_cursor=None, has_more=False),
-        metadata=TimeseriesMetadata(
-            sample_count=0,
-            start_time=_parse_date(start_date),
-            end_time=_parse_date(end_date),
-        ),
+        metadata=TimeseriesMetadata(sample_count=0, start_time=_parse_date(start_date), end_time=_parse_date(end_date)),
     )
-
-
-def _table_exists(db: DbSession, table_name: str) -> bool:
-    """Check if a table exists in the database."""
-    result = db.execute(
-        text("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = :name)"),
-        {"name": table_name},
-    )
-    return result.scalar() or False
 
 
 def _parse_date(date_str: str) -> datetime:
-    """Parse date string to datetime."""
     try:
         return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
     except ValueError:
