@@ -84,6 +84,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
         Useful for webhook processing where we receive provider's user ID
         and need to find our internal user.
+        Uses .first() instead of .one_or_none() to handle cases where
+        multiple connections exist (e.g. from reconnections).
         """
         return (
             db_session.query(self.model)
@@ -94,7 +96,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     self.model.status == ConnectionStatus.ACTIVE,
                 ),
             )
-            .one_or_none()
+            .order_by(self.model.updated_at.desc())
+            .first()
         )
 
     def get_by_user_id(
