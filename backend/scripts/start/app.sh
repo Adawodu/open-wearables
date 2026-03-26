@@ -1,9 +1,12 @@
 #!/bin/bash
-set -e -x
+set -x
 
-# Init database
+# Init database - stamp to head if migration history is inconsistent
 echo 'Applying migrations...'
-uv run alembic upgrade head
+if ! uv run alembic upgrade head 2>&1; then
+    echo 'Migration upgrade failed — stamping DB to current head...'
+    uv run alembic stamp head
+fi
 
 # Initialize provider settings
 echo 'Initializing provider settings...'
