@@ -194,12 +194,33 @@ def _store_daily(db: DbSession, ds_id: UUID, data: dict) -> None:
     end_dt = _ts_to_dt(start_ts + duration, offset)
     external_id = f"daily_{start_ts}"
 
-    # Dedup
+    # Check for existing record — UPDATE if found (dailies accumulate throughout the day)
     existing = db.execute(
         text("SELECT id FROM event_record WHERE data_source_id = :ds AND external_id = :eid LIMIT 1"),
         {"ds": str(ds_id), "eid": external_id},
     ).fetchone()
+
     if existing:
+        # Update existing daily with latest data
+        record_id = existing[0]
+        db.execute(
+            text("""UPDATE workout_details SET steps_count = :steps, energy_burned = :cal,
+                    distance = :dist, heart_rate_avg = :avg_hr, heart_rate_min = :min_hr,
+                    heart_rate_max = :max_hr, moving_time_seconds = :active
+                    WHERE record_id = :rid"""),
+            {
+                "rid": str(record_id),
+                "steps": data.get("steps"),
+                "cal": data.get("activeKilocalories"),
+                "dist": data.get("distanceInMeters"),
+                "avg_hr": data.get("averageHeartRateInBeatsPerMinute"),
+                "min_hr": data.get("minHeartRateInBeatsPerMinute"),
+                "max_hr": data.get("maxHeartRateInBeatsPerMinute"),
+                "active": data.get("activeTimeInSeconds"),
+            },
+        )
+        db.commit()
+        logger.info(f"Updated daily: {data.get('steps')} steps, {data.get('activeKilocalories')} cal")
         return
 
     record_id = uuid4()

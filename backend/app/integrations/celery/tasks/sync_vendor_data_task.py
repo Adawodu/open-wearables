@@ -47,7 +47,7 @@ def sync_vendor_data(
         ).model_dump()
 
     result = SyncVendorDataResult(
-        user_id=user_uuid,
+        user_id=str(user_uuid),
         start_date=start_date,
         end_date=end_date,
     )
