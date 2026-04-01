@@ -78,6 +78,18 @@ class Settings(BaseSettings):
     polar_redirect_uri: str = "http://localhost:8000/api/v1/oauth/polar/callback"
     polar_default_scope: str = "accesslink.read_all"
 
+    # STRAVA OAUTH SETTINGS
+    strava_client_id: str | None = None
+    strava_client_secret: SecretStr | None = None
+    strava_redirect_uri: str = "http://localhost:8000/api/v1/oauth/strava/callback"
+    strava_default_scope: str = "read,activity:read_all"
+
+    # FITBIT OAUTH SETTINGS
+    fitbit_client_id: str | None = None
+    fitbit_client_secret: SecretStr | None = None
+    fitbit_redirect_uri: str = "http://localhost:8000/api/v1/oauth/fitbit/callback"
+    fitbit_default_scope: str = "activity heartrate sleep profile"
+
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
     email_from_address: str | None = None

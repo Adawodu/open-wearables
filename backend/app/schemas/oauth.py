@@ -16,9 +16,11 @@ class ProviderName(str, Enum):
     """Supported data providers."""
 
     APPLE = "apple"
+    FITBIT = "fitbit"
     GARMIN = "garmin"
     GOOGLE_HEALTH = "google_health"
     POLAR = "polar"
+    STRAVA = "strava"
     SUUNTO = "suunto"
 
 
